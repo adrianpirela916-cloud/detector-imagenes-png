@@ -1,65 +1,83 @@
 import streamlit as st
 import pandas as pd
 import httpx
+from io import BytesIO
+from PIL import Image
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Configuración de la página web
-st.set_page_config(page_title="Analizador Universal de Inventario", page_icon="👓", layout="centered")
+# Configuración estética de la aplicación
+st.set_page_config(page_title="Detector de Posición PNG", page_icon="🎯", layout="centered")
 
-st.title("👓 Analizador Inteligente de Fotos por SKU")
-st.write("Sube cualquier Excel. El sistema detectará automáticamente el SKU y todas las columnas con enlaces.")
+st.title("🎯 Detector de Posición de Imágenes PNG")
+st.write("Sube tu Excel de 12 columnas. El sistema unirá el SKU con la posición exacta de la imagen transparente.")
 
+# Componente de subida de archivos
 uploaded_file = st.file_uploader("Elige tu archivo Excel (.xlsx)", type=["xlsx"])
 
-# 1. OPTIMIZACIÓN: Recibe el cliente HTTP reutilizable para no abrir/cerrar conexiones
-def verificar_url_sync(url, client):
+def detectar_transparencia_en_url(url, client):
+    """
+    Descarga la imagen de forma eficiente y analiza si contiene un canal alfa activo 
+    con píxeles transparentes (causa del fondo negro en el servidor).
+    """
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
     try:
-        # Intento 1: HEAD (Rápido y no descarga la imagen completa)
-        response = client.head(url, headers=headers, follow_redirects=True)
-        if response.status_code == 200:
-            return True
-        # Intento 2: GET (Por si el servidor bloquea HEAD)
-        response = client.get(url, headers=headers, follow_redirects=True)
-        return response.status_code == 200
+        response = client.get(url, headers=headers, timeout=6.0, follow_redirects=True)
+        if response.status_code != 200:
+            return False
+            
+        img = Image.open(BytesIO(response.content))
+        
+        # Si no maneja modos de transparencia estándar, se descarta
+        if img.mode not in ('RGBA', 'LA') and 'transparency' not in img.info:
+            return False
+            
+        # Extraemos el canal alfa para verificar si hay transparencia real
+        alpha = img.convert('RGBA').split()[-1]
+        extrema = alpha.getextrema()
+        
+        # Si el valor alfa mínimo es menor a 255, existen píxeles transparentes
+        return extrema < 255
     except:
         return False
 
-# Revisa la fila de forma dinámica
-def analizar_fila_inteligente(row_dict, columna_sku, client):
+def procesar_fila_catalogo(row_dict, columna_sku, columnas_imagenes, client):
+    """
+    Escanea horizontalmente las columnas de imágenes de un SKU.
+    Retorna una lista de hallazgos con el formato solicitado (SKU_Posición).
+    """
     current_sku = str(row_dict.get(columna_sku, '')).strip()
     if current_sku.endswith('.0'):
         current_sku = current_sku[:-2]
         
     if not current_sku or current_sku.lower() in ['nan', '']:
-        return None
+        return []
         
-    sku_tiene_error = False
+    hallazgos_sku = []
     
-    for clave, valor in row_dict.items():
-        if clave == columna_sku:
-            continue
-            
-        url = str(valor).strip()
+    # Recorremos las columnas de imágenes manteniendo el orden/posición de las 12 columnas
+    for indice_posicion, nombre_columna in enumerate(columnas_imagenes, start=1):
+        valor_celda = row_dict.get(nombre_columna)
+        url = str(valor_celda).strip() if pd.notna(valor_celda) else ""
+        
         if url and url.lower() != 'nan' and url.startswith("http"):
-            # Pasamos el cliente reutilizable
-            if not verificar_url_sync(url, client):
-                sku_tiene_error = True
-                break 
+            # Analizamos si la imagen en esta posición es la PNG transparente
+            if detectar_transparencia_en_url(url, client):
+                hallazgos_sku.append({
+                    "sku+posicion del link": f"{current_sku}_{indice_posicion}",
+                    "link de la imagen png": url
+                })
                 
-    if sku_tiene_error:
-        return current_sku
-    return None
+    return hallazgos_sku
 
 if uploaded_file is not None:
     try:
         df = pd.read_excel(uploaded_file)
         
-        # DETECCIÓN INTELIGENTE DE LA COLUMNA SKU
+        # 1. Identificación automática de la columna identificadora (SKU)
         columna_sku_detectada = None
-        nombres_comunes_sku = ['sku', 'modelo', 'model', 'count', 'id', 'codigo', 'item']
+        nombres_comunes_sku = ['sku', 'modelo', 'model', 'id', 'codigo', 'item', 'artículo', 'code']
         
         for col in df.columns:
             if str(col).strip().lower() in nombres_comunes_sku:
@@ -70,64 +88,71 @@ if uploaded_file is not None:
             columna_sku_detectada = df.columns[0]
             
         if not columna_sku_detectada:
-            st.error("❌ No se pudo determinar la columna del SKU. Asegúrate de que el Excel tenga datos.")
+            st.error("❌ No se pudo determinar la columna del SKU en el archivo.")
         else:
-            st.info(f"🔍 Sistema configurado automáticamente: Usando la columna **'{columna_sku_detectada}'** como identificador de SKU.")
+            # Las columnas de imágenes serán todas las demás columnas del Excel excluyendo el SKU
+            columnas_de_imagenes = [col for col in df.columns if col != columna_sku_detectada]
             
-            if st.button("🚀 Comenzar Análisis Masivo"):
-                skus_rotos = []
-                total = len(df)
+            st.info(f"🔍 SKU identificado en columna: **'{columna_sku_detectada}'**. Escaneando las **{len(columnas_de_imagenes)}** columnas de imágenes restantes.")
+            
+            if st.button("🚀 Iniciar Escaneo Quirúrgico"):
+                reporte_final_datos = []
+                total_filas = len(df)
                 
                 progreso_barra = st.progress(0)
                 texto_progreso = st.empty()
                 
-                # Convertimos eficientemente a diccionarios
-                filas_dict = df.to_dict(orient='records')
+                filas_lista_dict = df.to_dict(orient='records')
                 
-                # 2. OPTIMIZACIÓN: Un único cliente HTTP con límites de conexión reutilizables
-                limits = httpx.Limits(max_keepalive_connections=5, max_connections=20)
+                # Configuración de límites del cliente HTTP para evitar sobrecargas
+                limits = httpx.Limits(max_keepalive_connections=5, max_connections=15)
                 
-                with httpx.Client(verify=False, timeout=5.0, limits=limits) as client:
-                    # Subimos max_workers a 15-20 ya que la mayoría del tiempo es espera de red (I/O Bound)
-                    with ThreadPoolExecutor(max_workers=15) as executor:
+                with httpx.Client(verify=False, limits=limits) as client:
+                    with ThreadPoolExecutor(max_workers=8) as executor:
                         
-                        # Mapeamos los futures
-                        futuro_a_sku = {
-                            executor.submit(analizar_fila_inteligente, fila, columna_sku_detectada, client): fila 
-                            for fila in filas_dict
+                        # Lanzamos los hilos concurrentes
+                        futuros = {
+                            executor.submit(procesar_fila_catalogo, fila, columna_sku_detectada, columnas_de_imagenes, client): fila 
+                            for fila in filas_lista_dict
                         }
                         
-                        # 3. OPTIMIZACIÓN: as_completed permite actualizar la barra EN TIEMPO REAL
-                        for index, futuro in enumerate(as_completed(futuro_a_sku)):
+                        for index, futuro in enumerate(as_completed(futuros)):
                             try:
-                                sku_detectado = futuro.result()
-                                if sku_detectado:
-                                    skus_rotos.append(sku_detectado)
-                            except Exception as exc:
-                                # Captura errores individuales de hilos para que no se caiga toda la app
+                                resultados_fila = futuro.result()
+                                if resultados_fila:
+                                    reporte_final_datos.extend(resultados_fila)
+                            except Exception:
                                 pass
                             
-                            # Actualización fluida de la interfaz
-                            porcentaje = (index + 1) / total
-                            texto_progreso.text(f"Analizando fila {index + 1} de {total}...")
+                            # Actualización fluida de la barra de progreso
+                            porcentaje = (index + 1) / total_filas
+                            texto_progreso.text(f"Analizando producto {index + 1} de {total_filas}...")
                             progreso_barra.progress(porcentaje)
                 
-                texto_progreso.text("¡Análisis masivo finalizado!")
+                texto_progreso.text("¡Procesamiento masivo finalizado!")
                 
-                skus_finales = list(set([s for s in skus_rotos if s]))
-                
-                if skus_finales:
-                    st.warning(f"⚠️ Se encontraron {len(skus_finales)} SKUs con imágenes rotas.")
-                    txt_data = "\n".join(skus_finales)
+                # 2. Generación del reporte si se encontraron culpables
+                if reporte_final_datos:
+                    df_reporte = pd.DataFrame(reporte_final_datos)
                     
+                    st.subheader("📊 Vista Previa del Reporte de Transparentes")
+                    st.dataframe(df_reporte, use_container_width=True)
+                    
+                    # Escritura directa a buffer de memoria en formato Excel (.xlsx)
+                    output_excel = BytesIO()
+                    with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
+                        df_reporte.to_excel(writer, index=False, sheet_name='Reporte PNG')
+                    excel_procesado = output_excel.getvalue()
+                    
+                    st.success(f"⚠️ Se detectaron {len(df_reporte)} imágenes transparentes propensas a fondo negro.")
                     st.download_button(
-                        label="📥 Descargar skus_con_links_rotos.txt",
-                        data=txt_data,
-                        file_name="skus_con_links_rotos.txt",
-                        mime="text/plain"
+                        label="📥 Descargar reporte_posiciones_png.xlsx",
+                        data=excel_procesado,
+                        file_name="reporte_posiciones_png.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                     )
                 else:
-                    st.success("🎉 ¡Excelente! Absolutamente todos los enlaces del documento están activos.")
+                    st.success("🎉 ¡Excelente! No se detectaron imágenes PNG con canales de transparencia en las celdas analizadas.")
                     
     except Exception as e:
-        st.error(f"Error general al procesar el archivo: {e}")
+        st.error(f"Error crítico al procesar el documento Excel: {e}")
