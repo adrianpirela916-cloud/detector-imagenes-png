@@ -1,4 +1,4 @@
+httpx
 pandas
+Pillow
 openpyxl
-requests
-pillow
