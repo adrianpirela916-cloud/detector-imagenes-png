@@ -2,3 +2,4 @@ httpx
 pandas
 Pillow
 openpyxl
+streamlit
