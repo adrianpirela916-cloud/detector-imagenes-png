@@ -24,6 +24,10 @@ def detectar_transparencia_en_url(url, client):
     if url_clean.endswith('.png') or url_clean.endswith('.webp'):
         return True
 
+    # Si explícitamente termina en .jpg o .jpeg, ignoramos transparencia de inmediato
+    if url_clean.endswith('.jpg') or url_clean.endswith('.jpeg'):
+        return False
+
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
@@ -38,12 +42,18 @@ def detectar_transparencia_en_url(url, client):
         if 'transparency' in img.info:
             return True
             
-        # Criterio 2: Maneja canales nativos de transparencia (RGBA o LA)
+        # Criterio 2: Maneja canales nativos de transparencia (RGBA o LA) con umbral tolerante al ruido
         if img.mode in ('RGBA', 'LA'):
             alpha = img.convert('RGBA').split()[-1]
-            extrema = alpha.getextrema()
-            # Umbral flexible: Si al menos un píxel no es totalmente opaco (255), tiene transparencia
-            if extrema[0] < 255:
+            # Obtenemos los datos del histograma del canal alfa
+            # Si hay píxeles transparentes reales (valores menores a 255)
+            # contamos cuántos píxeles no son totalmente opacos
+            datos_alfa = list(alpha.getdata())
+            pixeles_totales = len(datos_alfa)
+            pixeles_transparentes = sum(1 for p in datos_alfa if p < 250) # Tolerancia a píxeles semi-opacos
+            
+            # Umbral quirúrgico: Al menos el 1% de la imagen debe ser transparente
+            if (pixeles_transparentes / pixeles_totales) > 0.01:
                 return True
                 
         # Criterio 3: Formato explícito reportado por Pillow
